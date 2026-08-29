@@ -44,6 +44,9 @@ type RabbitMQ struct {
 	closeOnce  sync.Once
 	closeDone  chan struct{}
 	reconnectW sync.WaitGroup
+
+	reconnectCallbacksMu sync.RWMutex
+	reconnectCallbacks   []func()
 }
 
 type rabbitMQSubscriptionKind int
@@ -63,6 +66,7 @@ type rabbitMQSubscription struct {
 }
 
 type rabbitMQState struct {
+	conn             *amqp.Connection
 	pubCh            *amqp.Channel
 	consCh           *amqp.Channel
 	ready            <-chan struct{}
@@ -115,6 +119,18 @@ func (mq *RabbitMQ) SubscribeBroadcast(ctx context.Context) (<-chan []byte, erro
 
 func (mq *RabbitMQ) SubscribeDirect(ctx context.Context, peerID string) (<-chan []byte, error) {
 	return mq.subscribe(ctx, rabbitMQSubscriptionDirect, peerID)
+}
+
+// OnReconnect registers a callback that is invoked after a lost RabbitMQ
+// connection has been restored. It is not invoked for the initial connection.
+func (mq *RabbitMQ) OnReconnect(callback func()) {
+	if callback == nil {
+		return
+	}
+
+	mq.reconnectCallbacksMu.Lock()
+	mq.reconnectCallbacks = append(mq.reconnectCallbacks, callback)
+	mq.reconnectCallbacksMu.Unlock()
 }
 
 func (mq *RabbitMQ) Close() error {
@@ -195,7 +211,7 @@ func (mq *RabbitMQ) publish(ctx context.Context, exchange string, routingKey str
 			return ctx.Err()
 		}
 
-		mq.triggerReconnect()
+		mq.triggerReconnect(state.conn)
 		if err := waitForRabbitMQReady(ctx, mq.snapshot().ready, mq.closeDone); err != nil {
 			return err
 		}
@@ -242,7 +258,7 @@ func (mq *RabbitMQ) subscribe(ctx context.Context, kind rabbitMQSubscriptionKind
 		mq.removeSubscription(sub)
 		close(sub.out)
 		cancel()
-		mq.triggerReconnect()
+		mq.triggerReconnect(mq.snapshot().conn)
 		return nil, err
 	}
 
@@ -274,7 +290,7 @@ func (mq *RabbitMQ) runSubscription(sub *rabbitMQSubscription, deliveries <-chan
 			if sub.ctx.Err() != nil {
 				return
 			}
-			mq.triggerReconnect()
+			mq.triggerReconnect(mq.snapshot().conn)
 			lastGeneration = generation
 			continue
 		}
@@ -471,21 +487,20 @@ func (mq *RabbitMQ) setConnected(conn *amqp.Connection, pubCh *amqp.Channel, con
 	return true
 }
 
-func (mq *RabbitMQ) triggerReconnect() {
-	if !mq.setDisconnected() {
+func (mq *RabbitMQ) triggerReconnect(failedConn *amqp.Connection) {
+	if !mq.setDisconnected(failedConn) {
 		return
 	}
 
-	mq.reconnectW.Add(1)
 	go func() {
 		defer mq.reconnectW.Done()
 		mq.reconnect()
 	}()
 }
 
-func (mq *RabbitMQ) setDisconnected() bool {
+func (mq *RabbitMQ) setDisconnected(failedConn *amqp.Connection) bool {
 	mq.stateMu.Lock()
-	if mq.closed || !mq.readyClosed {
+	if mq.closed || !mq.readyClosed || failedConn == nil || mq.conn != failedConn {
 		mq.stateMu.Unlock()
 		return false
 	}
@@ -498,6 +513,9 @@ func (mq *RabbitMQ) setDisconnected() bool {
 	mq.consCh = nil
 	mq.ready = make(chan struct{})
 	mq.readyClosed = false
+	// Add while holding stateMu. Close takes the same lock before Wait, so an
+	// Add can never race with a zero-counter Wait.
+	mq.reconnectW.Add(1)
 	mq.stateMu.Unlock()
 
 	if pubCh != nil {
@@ -527,6 +545,7 @@ func (mq *RabbitMQ) reconnect() {
 		if err == nil {
 			if mq.setConnected(conn, pubCh, consCh) {
 				mq.watchConnection(conn, pubCh, consCh)
+				mq.notifyReconnected()
 			} else {
 				_ = consCh.Close()
 				_ = pubCh.Close()
@@ -552,11 +571,11 @@ func (mq *RabbitMQ) watchConnection(conn *amqp.Connection, pubCh *amqp.Channel, 
 	go func() {
 		select {
 		case <-connClosed:
-			mq.triggerReconnect()
+			mq.triggerReconnect(conn)
 		case <-pubClosed:
-			mq.triggerReconnect()
+			mq.triggerReconnect(conn)
 		case <-consClosed:
-			mq.triggerReconnect()
+			mq.triggerReconnect(conn)
 		case <-mq.closeDone:
 		}
 	}()
@@ -567,6 +586,7 @@ func (mq *RabbitMQ) snapshot() rabbitMQState {
 	defer mq.stateMu.RUnlock()
 
 	return rabbitMQState{
+		conn:             mq.conn,
 		pubCh:            mq.pubCh,
 		consCh:           mq.consCh,
 		ready:            mq.ready,
@@ -574,6 +594,16 @@ func (mq *RabbitMQ) snapshot() rabbitMQState {
 		generation:       mq.generation,
 		closed:           mq.closed,
 		connected:        mq.readyClosed,
+	}
+}
+
+func (mq *RabbitMQ) notifyReconnected() {
+	mq.reconnectCallbacksMu.RLock()
+	callbacks := append([]func(){}, mq.reconnectCallbacks...)
+	mq.reconnectCallbacksMu.RUnlock()
+
+	for _, callback := range callbacks {
+		callback()
 	}
 }
 

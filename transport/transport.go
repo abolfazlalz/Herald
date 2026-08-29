@@ -11,3 +11,10 @@ type Transport interface {
 
 	Close() error
 }
+
+// ReconnectNotifier is implemented by transports that can recover their
+// connection. Callbacks run after the transport is ready to publish and
+// consume again.
+type ReconnectNotifier interface {
+	OnReconnect(func())
+}

@@ -22,7 +22,7 @@ import (
 
 const (
 	// PeerTimeout defines the duration after which a peer is considered offline.
-	PeerTimeout           = 5 * time.Second
+	PeerTimeout           = 30 * time.Second
 	MessageTimeout        = 10 * time.Second
 	PeerConnectingTimeout = 5 * time.Second
 )
@@ -316,6 +316,16 @@ func (h *Herald) Start(ctx context.Context) error {
 		}
 	}()
 	h.logger.Info(ctx, "Service started", "ID", h.ID())
+
+	if notifier, ok := h.transport.(transport.ReconnectNotifier); ok {
+		notifier.OnReconnect(func() {
+			if err := h.startHandshake(ctx); err != nil {
+				h.logger.Error(ctx, "reconnect handshake failed", "error", err)
+				return
+			}
+			h.logger.Info(ctx, "reconnect handshake initiated")
+		})
+	}
 
 	bc, err := h.transport.SubscribeBroadcast(ctx)
 	if err != nil {
